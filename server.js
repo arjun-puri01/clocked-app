@@ -133,6 +133,10 @@ app.post('/api/gatherings', async (req, res) => {
     const { name, time, location, lat, lng, invitedUserIds } = req.body;
     const userId = req.uid;
 
+    if (!invitedUserIds || invitedUserIds.length === 0) {
+      return res.status(400).json({ error: 'Invite at least one friend — gatherings need more than one person.' });
+    }
+
     const creatorDoc = await db.collection('users').doc(userId).get();
     const creatorName = creatorDoc.exists ? (creatorDoc.data().name || 'Unknown') : 'Unknown';
 
@@ -234,6 +238,21 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
 
     const isOnTime = timeDiff <= 0;
 
+    // Progressive late penalty based on how many minutes late
+    const lateMinutes = Math.max(0, Math.round(timeDiff));
+    let pointsDelta;
+    if (isOnTime) {
+      pointsDelta = 10;
+    } else if (lateMinutes <= 15) {
+      pointsDelta = -2;
+    } else if (lateMinutes <= 30) {
+      pointsDelta = -5;
+    } else if (lateMinutes <= 60) {
+      pointsDelta = -8;
+    } else {
+      pointsDelta = -10;
+    }
+
     if (gathering.lat != null && gathering.lng != null) {
       if (lat == null || lng == null) {
         return res.status(400).json({ error: 'Location access is required to check in to this gathering' });
@@ -253,27 +272,22 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
     const userData = userDoc.exists ? userDoc.data() : {};
 
     const newStreak = isOnTime ? (userData.currentStreak || 0) + 1 : 0;
-    const newPoints = isOnTime
-      ? (userData.points || 0) + 10
-      : Math.max(0, (userData.points || 0) - 5);
+    const newPoints = Math.max(0, (userData.points || 0) + pointsDelta);
     const newLongest = Math.max(userData.longestStreak || 0, newStreak);
 
     await userRef.update({ points: newPoints, currentStreak: newStreak, longestStreak: newLongest });
 
-    // Notify other checked-in members if this person is late
     if (!isOnTime) {
       const checkerName = gathering.members[memberIndex].name;
-      const minutesLate = Math.round(timeDiff);
       for (const m of gathering.members) {
         if (m.uid !== userId && m.arrivedAt != null) {
           await createNotification(m.uid, 'late_arrival',
-            `${checkerName} just checked in ${minutesLate}m late to "${gathering.name}"!`);
+            `${checkerName} checked in ${lateMinutes}m late to "${gathering.name}"`);
         }
       }
     }
 
-    const pointsDelta = isOnTime ? 10 : -5;
-    res.json({ ...gathering.members[memberIndex], points: newPoints, currentStreak: newStreak, pointsDelta });
+    res.json({ ...gathering.members[memberIndex], points: newPoints, currentStreak: newStreak, pointsDelta, lateMinutes });
   } catch (error) {
     console.error('Error checking in:', error);
     res.status(500).json({ error: error.message });
@@ -990,7 +1004,7 @@ app.get('/api/challenges', async (req, res) => {
 
 async function processAutoLate() {
   try {
-    const GRACE_MINUTES = 15;
+    const GRACE_MINUTES = 60;
     const now = Date.now();
     const cutoff = new Date(now - GRACE_MINUTES * 60 * 1000);    // must be at least 15 min ago
     const lookback = new Date(now - 48 * 60 * 60 * 1000);        // don't re-process old gatherings
@@ -1032,7 +1046,7 @@ async function processAutoLate() {
       if (userDoc.exists) {
         const userData = userDoc.data();
         await userRef.update({
-          points: Math.max(0, (userData.points || 0) - 5),
+          points: Math.max(0, (userData.points || 0) - 10),
           currentStreak: 0,
         });
       }
