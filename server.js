@@ -926,7 +926,7 @@ app.post('/api/gatherings/:id/nudge', async (req, res) => {
     const senderDoc = await db.collection('users').doc(req.uid).get();
     const senderName = senderDoc.exists ? (senderDoc.data().name || 'Someone') : 'Someone';
     await createNotification(targetUid, 'nudge', `${senderName}: ${message}`);
-    await sendFcmToUids([targetUid], `${senderName} nudged you 👀`, message);
+    await sendFcmToUids([targetUid], `${senderName} nudged you`, message);
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1239,7 +1239,7 @@ async function sendGatheringReminders() {
       for (const { uid, streak } of atRisk) {
         await sendFcmToUids(
           [uid],
-          `🔥 Streak at risk`,
+          `Streak at risk`,
           `Your ${streak}-day streak could break — "${g.name}" starts in 30 min. Don't miss it.`
         );
       }
