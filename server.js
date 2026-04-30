@@ -80,6 +80,41 @@ async function createNotification(userId, type, message) {
   });
 }
 
+// Send FCM push to one or more user UIDs; cleans up stale tokens automatically
+async function sendFcmToUids(uids, title, body) {
+  if (!uids.length) return;
+  const tokens = [];
+  const tokenToUid = {};
+  for (const uid of uids) {
+    const doc = await db.collection('users').doc(uid).get();
+    if (!doc.exists) continue;
+    for (const t of (doc.data().fcmTokens || [])) {
+      tokens.push(t);
+      tokenToUid[t] = uid;
+    }
+  }
+  if (!tokens.length) return;
+  const result = await admin.messaging().sendEachForMulticast({ tokens, notification: { title, body } });
+  const stale = result.responses
+    .map((r, i) => (!r.success &&
+      (r.error?.code === 'messaging/registration-token-not-registered' ||
+       r.error?.code === 'messaging/invalid-registration-token')) ? tokens[i] : null)
+    .filter(Boolean);
+  if (stale.length) {
+    const staleByUid = {};
+    for (const t of stale) {
+      const uid = tokenToUid[t];
+      if (uid) (staleByUid[uid] = staleByUid[uid] || []).push(t);
+    }
+    for (const [uid, bad] of Object.entries(staleByUid)) {
+      const doc = await db.collection('users').doc(uid).get();
+      if (!doc.exists) continue;
+      const cleaned = (doc.data().fcmTokens || []).filter(t => !bad.includes(t));
+      await db.collection('users').doc(uid).update({ fcmTokens: cleaned });
+    }
+  }
+}
+
 // ── FCM token registration ────────────────────────────────────────────────────
 
 // Store/update the FCM push token for the authenticated user's device.
@@ -291,12 +326,16 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
 
     if (!isOnTime) {
       const checkerName = gathering.members[memberIndex].name;
-      for (const m of gathering.members) {
-        if (m.uid !== userId && m.arrivedAt != null) {
-          await createNotification(m.uid, 'late_arrival',
-            `${checkerName} checked in ${lateMinutes}m late to "${gathering.name}"`);
-        }
-      }
+      const otherUids = gathering.members.filter(m => m.uid !== userId).map(m => m.uid);
+      await Promise.all(otherUids.map(uid =>
+        createNotification(uid, 'late_arrival',
+          `${checkerName} checked in ${lateMinutes}m late to "${gathering.name}"`)
+      ));
+      await sendFcmToUids(
+        otherUids,
+        `⏰ Late check-in`,
+        `${checkerName} just checked in ${lateMinutes}m late to "${gathering.name}"`
+      );
     }
 
     res.json({ ...gathering.members[memberIndex], points: newPoints, currentStreak: newStreak, pointsDelta, lateMinutes });
@@ -872,6 +911,28 @@ app.post('/api/gatherings/:id/react', async (req, res) => {
   }
 });
 
+// ── Nudge ─────────────────────────────────────────────────────────────────────
+
+// Send a quick preset message as a push notification to another gathering member
+app.post('/api/gatherings/:id/nudge', async (req, res) => {
+  try {
+    const { targetUid, message } = req.body;
+    if (!targetUid || !message) return res.status(400).json({ error: 'targetUid and message required' });
+    const doc = await db.collection('gatherings').doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Gathering not found' });
+    const g = doc.data();
+    if (!(g.memberIds || []).includes(req.uid)) return res.status(403).json({ error: 'Not a member' });
+    if (!(g.memberIds || []).includes(targetUid)) return res.status(400).json({ error: 'Target is not a member' });
+    const senderDoc = await db.collection('users').doc(req.uid).get();
+    const senderName = senderDoc.exists ? (senderDoc.data().name || 'Someone') : 'Someone';
+    await createNotification(targetUid, 'nudge', `${senderName}: ${message}`);
+    await sendFcmToUids([targetUid], `${senderName} nudged you 👀`, message);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Activity feed ─────────────────────────────────────────────────────────────
 
 app.get('/api/activity', async (req, res) => {
@@ -1119,6 +1180,8 @@ setTimeout(processAutoLate, 10000);
 async function sendGatheringReminders() {
   try {
     const now = Date.now();
+
+    // ── Standard reminders (broadcast to all members) ─────────────────────────
     const reminders = [
       {
         label: '60min',
@@ -1139,63 +1202,50 @@ async function sendGatheringReminders() {
     for (const reminder of reminders) {
       const from = new Date(reminder.fromMs).toISOString();
       const to   = new Date(reminder.toMs).toISOString();
-
-      const snap = await db.collection('gatherings')
-        .where('time', '>=', from)
-        .where('time', '<=', to)
-        .get();
+      const snap = await db.collection('gatherings').where('time', '>=', from).where('time', '<=', to).get();
 
       for (const doc of snap.docs) {
         const g = doc.data();
         const sent = g.remindersSent || [];
-        if (sent.includes(reminder.label)) continue; // already sent this reminder
-
-        // Mark as sent immediately to prevent duplicate sends
+        if (sent.includes(reminder.label)) continue;
         await doc.ref.update({ remindersSent: [...sent, reminder.label] });
-
-        // Collect FCM tokens for all members
-        const tokens = [];
-        for (const uid of (g.memberIds || [])) {
-          const userDoc = await db.collection('users').doc(uid).get();
-          if (userDoc.exists) {
-            const userTokens = userDoc.data().fcmTokens || [];
-            tokens.push(...userTokens);
-          }
-        }
-        if (tokens.length === 0) continue;
-
-        // Send via FCM
-        const result = await admin.messaging().sendEachForMulticast({
-          tokens,
-          notification: { title: reminder.title, body: reminder.body(g.name) },
-          webpush: { fcmOptions: { link: '/' } },
-        });
-        console.log(`Reminder [${reminder.label}] "${g.name}": ${result.successCount} sent, ${result.failureCount} failed`);
-
-        // Remove stale tokens (expired/unregistered)
-        const staleTokens = [];
-        result.responses.forEach((r, i) => {
-          if (!r.success && (
-            r.error?.code === 'messaging/registration-token-not-registered' ||
-            r.error?.code === 'messaging/invalid-registration-token'
-          )) {
-            staleTokens.push(tokens[i]);
-          }
-        });
-        if (staleTokens.length > 0) {
-          // Remove stale tokens from each affected user
-          for (const uid of (g.memberIds || [])) {
-            const userDoc = await db.collection('users').doc(uid).get();
-            if (!userDoc.exists) continue;
-            const current = userDoc.data().fcmTokens || [];
-            const cleaned = current.filter(t => !staleTokens.includes(t));
-            if (cleaned.length !== current.length) {
-              await db.collection('users').doc(uid).update({ fcmTokens: cleaned });
-            }
-          }
-        }
+        await sendFcmToUids(g.memberIds || [], reminder.title, reminder.body(g.name));
+        console.log(`Reminder [${reminder.label}] sent for "${g.name}"`);
       }
     }
+
+    // ── Streak-risk reminder (30 min before, only members with active streaks) ──
+    const streakFrom = new Date(now + 28 * 60 * 1000).toISOString();
+    const streakTo   = new Date(now + 32 * 60 * 1000).toISOString();
+    const streakSnap = await db.collection('gatherings').where('time', '>=', streakFrom).where('time', '<=', streakTo).get();
+
+    for (const doc of streakSnap.docs) {
+      const g = doc.data();
+      const sent = g.remindersSent || [];
+      if (sent.includes('streak-risk')) continue;
+      await doc.ref.update({ remindersSent: [...sent, 'streak-risk'] });
+
+      // Only ping members who haven't checked in and have an active streak
+      const atRisk = [];
+      for (const uid of (g.memberIds || [])) {
+        const member = (g.members || []).find(m => m.uid === uid);
+        if (member?.arrivedAt) continue; // already checked in
+        const userDoc = await db.collection('users').doc(uid).get();
+        if (!userDoc.exists) continue;
+        const streak = userDoc.data().currentStreak || 0;
+        if (streak > 0) atRisk.push({ uid, streak });
+      }
+
+      for (const { uid, streak } of atRisk) {
+        await sendFcmToUids(
+          [uid],
+          `🔥 Streak at risk`,
+          `Your ${streak}-day streak could break — "${g.name}" starts in 30 min. Don't miss it.`
+        );
+      }
+      if (atRisk.length) console.log(`Streak-risk nudge sent for "${g.name}" to ${atRisk.length} members`);
+    }
+
   } catch (err) {
     console.error('Reminder job error:', err);
   }
