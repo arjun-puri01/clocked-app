@@ -356,19 +356,13 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
 
     const isOnTime = timeDiff <= 0;
 
-    // Progressive late penalty based on how many minutes late
+    // Proportional late penalty: -1 pt per 6 mins late, capped at -10
     const lateMinutes = Math.max(0, Math.round(timeDiff));
     let pointsDelta;
     if (isOnTime) {
       pointsDelta = 10;
-    } else if (lateMinutes === 0 || lateMinutes <= 15) {
-      pointsDelta = -2;
-    } else if (lateMinutes <= 30) {
-      pointsDelta = -5;
-    } else if (lateMinutes <= 60) {
-      pointsDelta = -8;
     } else {
-      pointsDelta = -10;
+      pointsDelta = -Math.min(10, Math.max(1, Math.round(lateMinutes / 6)));
     }
 
     if (gathering.lat != null && gathering.lng != null) {
@@ -390,7 +384,7 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
     const userData = userDoc.exists ? userDoc.data() : {};
 
     const newStreak = isOnTime ? (userData.currentStreak || 0) + 1 : 0;
-    const newPoints = Math.max(0, (userData.points || 0) + pointsDelta);
+    const newPoints = (userData.points || 0) + pointsDelta;
     const newLongest = Math.max(userData.longestStreak || 0, newStreak);
 
     await userRef.update({ points: newPoints, currentStreak: newStreak, longestStreak: newLongest });
@@ -1222,7 +1216,7 @@ async function processAutoLate() {
       if (userDoc.exists) {
         const userData = userDoc.data();
         await userRef.update({
-          points: Math.max(0, (userData.points || 0) - 10),
+          points: (userData.points || 0) - 10,
           currentStreak: 0,
         });
       }
