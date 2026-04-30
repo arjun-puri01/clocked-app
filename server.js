@@ -80,7 +80,30 @@ async function createNotification(userId, type, message) {
   });
 }
 
-// Send FCM push to one or more user UIDs; cleans up stale tokens automatically
+// Send via Expo's push service — works with Expo Go on real devices
+async function sendExpoPushToUids(uids, title, body) {
+  if (!uids.length) return;
+  const tokens = [];
+  for (const uid of uids) {
+    const doc = await db.collection('users').doc(uid).get();
+    if (doc.exists) tokens.push(...(doc.data().expoPushTokens || []));
+  }
+  if (!tokens.length) return;
+  try {
+    const res = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(tokens.map(to => ({ to, title, body, sound: 'default' }))),
+    });
+    const result = await res.json();
+    const errors = (result.data || []).filter(r => r.status === 'error');
+    if (errors.length) console.warn('Expo push errors:', JSON.stringify(errors));
+  } catch (e) {
+    console.error('Expo push failed:', e.message);
+  }
+}
+
+// Legacy FCM path — kept for future Android / standalone builds
 async function sendFcmToUids(uids, title, body) {
   if (!uids.length) return;
   const tokens = [];
@@ -115,6 +138,14 @@ async function sendFcmToUids(uids, title, body) {
   }
 }
 
+// Send to all registered push channels for a set of UIDs
+async function sendPushToUids(uids, title, body) {
+  await Promise.all([
+    sendExpoPushToUids(uids, title, body),
+    sendFcmToUids(uids, title, body),
+  ]);
+}
+
 // ── FCM token registration ────────────────────────────────────────────────────
 
 // Store/update the FCM push token for the authenticated user's device.
@@ -135,6 +166,23 @@ app.post('/api/users/fcm-token', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Error saving FCM token:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Store Expo push token (used by Expo Go and Expo-built apps)
+app.post('/api/users/expo-token', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'token is required' });
+    const userRef = db.collection('users').doc(req.uid);
+    const userDoc = await userRef.get();
+    const existing = userDoc.exists ? (userDoc.data().expoPushTokens || []) : [];
+    if (!existing.includes(token)) {
+      await userRef.set({ expoPushTokens: [...existing, token].slice(-10) }, { merge: true });
+    }
+    res.json({ success: true });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
@@ -331,9 +379,9 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
         createNotification(uid, 'late_arrival',
           `${checkerName} checked in ${lateMinutes}m late to "${gathering.name}"`)
       ));
-      await sendFcmToUids(
+      await sendPushToUids(
         otherUids,
-        `⏰ Late check-in`,
+        `Late check-in`,
         `${checkerName} just checked in ${lateMinutes}m late to "${gathering.name}"`
       );
     }
@@ -926,7 +974,7 @@ app.post('/api/gatherings/:id/nudge', async (req, res) => {
     const senderDoc = await db.collection('users').doc(req.uid).get();
     const senderName = senderDoc.exists ? (senderDoc.data().name || 'Someone') : 'Someone';
     await createNotification(targetUid, 'nudge', `${senderName}: ${message}`);
-    await sendFcmToUids([targetUid], `${senderName} nudged you`, message);
+    await sendPushToUids([targetUid], `${senderName} nudged you`, message);
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1209,7 +1257,7 @@ async function sendGatheringReminders() {
         const sent = g.remindersSent || [];
         if (sent.includes(reminder.label)) continue;
         await doc.ref.update({ remindersSent: [...sent, reminder.label] });
-        await sendFcmToUids(g.memberIds || [], reminder.title, reminder.body(g.name));
+        await sendPushToUids(g.memberIds || [], reminder.title, reminder.body(g.name));
         console.log(`Reminder [${reminder.label}] sent for "${g.name}"`);
       }
     }
@@ -1237,7 +1285,7 @@ async function sendGatheringReminders() {
       }
 
       for (const { uid, streak } of atRisk) {
-        await sendFcmToUids(
+        await sendPushToUids(
           [uid],
           `Streak at risk`,
           `Your ${streak}-day streak could break — "${g.name}" starts in 30 min. Don't miss it.`
