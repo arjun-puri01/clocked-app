@@ -80,26 +80,48 @@ async function createNotification(userId, type, message) {
   });
 }
 
-// Send via Expo's push service — works with Expo Go on real devices
+// Send via Expo's push service — handles both ExponentPushToken and raw device tokens
 async function sendExpoPushToUids(uids, title, body) {
   if (!uids.length) return;
-  const tokens = [];
+  const expoTokens = [];
+  const apnsTokens = [];
   for (const uid of uids) {
     const doc = await db.collection('users').doc(uid).get();
-    if (doc.exists) tokens.push(...(doc.data().expoPushTokens || []));
+    if (!doc.exists) continue;
+    for (const t of (doc.data().expoPushTokens || [])) {
+      if (typeof t === 'string' && t.startsWith('ExponentPushToken[')) {
+        expoTokens.push(t);
+      } else if (typeof t === 'string' && t.length > 0) {
+        apnsTokens.push(t); // raw APNs/FCM device token
+      }
+    }
   }
-  if (!tokens.length) return;
-  try {
-    const res = await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(tokens.map(to => ({ to, title, body, sound: 'default' }))),
-    });
-    const result = await res.json();
-    const errors = (result.data || []).filter(r => r.status === 'error');
-    if (errors.length) console.warn('Expo push errors:', JSON.stringify(errors));
-  } catch (e) {
-    console.error('Expo push failed:', e.message);
+  // Send Expo push tokens via Expo's API
+  if (expoTokens.length) {
+    try {
+      const res = await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(expoTokens.map(to => ({ to, title, body, sound: 'default' }))),
+      });
+      const result = await res.json();
+      const errors = (result.data || []).filter(r => r.status === 'error');
+      if (errors.length) console.warn('Expo push errors:', JSON.stringify(errors));
+    } catch (e) {
+      console.error('Expo push failed:', e.message);
+    }
+  }
+  // Raw device tokens go through FCM (handles both APNs and Android)
+  if (apnsTokens.length) {
+    try {
+      await admin.messaging().sendEachForMulticast({
+        tokens: apnsTokens,
+        notification: { title, body },
+        apns: { payload: { aps: { sound: 'default' } } },
+      });
+    } catch (e) {
+      console.error('FCM device token push failed:', e.message);
+    }
   }
 }
 
