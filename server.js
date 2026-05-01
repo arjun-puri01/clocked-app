@@ -355,11 +355,14 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
     }
 
     const isOnTime = timeDiff <= 0;
+    const isEarly = timeDiff <= -5; // 5+ minutes early = early bird bonus
 
-    // Proportional late penalty: -1 pt per 6 mins late, capped at -10
+    // Points: +12 early, +10 on time, proportional negative for late
     const lateMinutes = Math.max(0, Math.round(timeDiff));
     let pointsDelta;
-    if (isOnTime) {
+    if (isEarly) {
+      pointsDelta = 12;
+    } else if (isOnTime) {
       pointsDelta = 10;
     } else {
       pointsDelta = -Math.min(10, Math.max(1, Math.round(lateMinutes / 6)));
@@ -403,7 +406,7 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
       );
     }
 
-    res.json({ ...gathering.members[memberIndex], points: newPoints, currentStreak: newStreak, pointsDelta, lateMinutes });
+    res.json({ ...gathering.members[memberIndex], points: newPoints, currentStreak: newStreak, pointsDelta, lateMinutes, earlyBonus: isEarly });
   } catch (error) {
     console.error('Error checking in:', error);
     res.status(500).json({ error: error.message });
@@ -1163,10 +1166,74 @@ app.get('/api/challenges', async (req, res) => {
       }, { merge: true });
     }
 
-    res.json({ challenges, weekStart: start.toISOString(), awarded: [...awarded, ...newlyAwarded] });
+    const shieldKey = `shield_${start.toISOString().slice(0, 10)}`;
+    const streakShieldAvailable = !userData[shieldKey];
+    res.json({ challenges, weekStart: start.toISOString(), awarded: [...awarded, ...newlyAwarded], streakShieldAvailable });
   } catch (error) {
     console.error('Error fetching challenges:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Weekly leaderboard — stats for the current Mon–Sun window only
+app.get('/api/leaderboard/weekly', async (req, res) => {
+  try {
+    const userId = req.uid;
+    const { start, end } = getWeekBounds();
+
+    const friendsSnap = await db.collection('friends').where('users', 'array-contains', userId).get();
+    const friendUids = [userId];
+    friendsSnap.forEach(doc => {
+      if (doc.data().status === 'accepted')
+        friendUids.push(doc.data().users.find(u => u !== userId));
+    });
+
+    const [gatheringsSnap, ...profileDocs] = await Promise.all([
+      db.collection('gatherings').where('time', '>=', start.toISOString()).where('time', '<', end.toISOString()).get(),
+      ...friendUids.map(uid => db.collection('users').doc(uid).get()),
+    ]);
+
+    const profiles = {};
+    profileDocs.forEach(doc => { if (doc.exists) profiles[doc.id] = doc.data(); });
+
+    const stats = friendUids.map(uid => {
+      let onTime = 0, late = 0, weeklyPoints = 0;
+      gatheringsSnap.forEach(doc => {
+        const g = doc.data();
+        if (!(g.memberIds || []).includes(uid)) return;
+        const m = (g.members || []).find(m => m.uid === uid);
+        if (!m || m.arrivedAt == null) return;
+        if (m.isOnTime) {
+          onTime++;
+          weeklyPoints += 10;
+        } else {
+          late++;
+          const arrivedMs = m.arrivedAt._seconds ? m.arrivedAt._seconds * 1000 : new Date(m.arrivedAt).getTime();
+          const minsLate = Math.max(0, Math.round((arrivedMs - new Date(g.time).getTime()) / 60000));
+          weeklyPoints -= Math.min(10, Math.max(1, Math.round(minsLate / 6)));
+        }
+      });
+      const p = profiles[uid] || {};
+      const attended = onTime + late;
+      return {
+        uid, name: p.name || 'Unknown', username: p.username || '', photoUrl: p.photoUrl || null,
+        onTime, late, attended, weeklyPoints,
+        punctualityRate: attended > 0 ? Math.round((onTime / attended) * 100) : null,
+        currentStreak: p.currentStreak || 0,
+        isYou: uid === userId,
+      };
+    });
+
+    stats.sort((a, b) => {
+      if (b.weeklyPoints !== a.weeklyPoints) return b.weeklyPoints - a.weeklyPoints;
+      if (a.punctualityRate === null) return 1;
+      if (b.punctualityRate === null) return -1;
+      return b.punctualityRate - a.punctualityRate;
+    });
+
+    res.json(stats);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -1240,15 +1307,22 @@ async function processAutoLate() {
     }
 
     // Update user stats and send notifications
+    const { start: weekStart } = getWeekBounds();
+    const shieldKey = `shield_${weekStart.toISOString().slice(0, 10)}`;
+
     for (const { uid, gatheringName, memberName, allMembers } of notifications) {
       const userRef = db.collection('users').doc(uid);
       const userDoc = await userRef.get();
       if (userDoc.exists) {
         const userData = userDoc.data();
-        await userRef.update({
-          points: (userData.points || 0) - 10,
-          currentStreak: 0,
-        });
+        const shieldAvailable = !userData[shieldKey] && (userData.currentStreak || 0) > 0;
+        if (shieldAvailable) {
+          // Shield absorbs the no-show — streak survives, points still deducted
+          await userRef.update({ points: (userData.points || 0) - 10, [shieldKey]: true });
+          await sendPushToUids([uid], 'Streak shield activated', `Your ${userData.currentStreak}-streak was protected from "${gatheringName}". Shield used for this week.`);
+        } else {
+          await userRef.update({ points: (userData.points || 0) - 10, currentStreak: 0 });
+        }
       }
       // Notify checked-in members about the no-show
       for (const other of allMembers) {
