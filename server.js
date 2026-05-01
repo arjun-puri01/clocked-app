@@ -682,7 +682,41 @@ app.get('/api/leaderboard', async (req, res) => {
 });
 
 // ── Users ────────────────────────────────────────────────────────────────────
-// NOTE: /api/users/search and /api/users/profile must come before /api/users/:uid/*
+// NOTE: /api/users/search, /api/users/profile and /api/users/gathered-with must come before /api/users/:uid/*
+
+// Users who share gatherings with the current user but aren't friends yet
+app.get('/api/users/gathered-with', async (req, res) => {
+  try {
+    const userId = req.uid;
+    const [gatheringsSnap, friendsSnap] = await Promise.all([
+      db.collection('gatherings').where('memberIds', 'array-contains', userId).get(),
+      db.collection('friends').where('users', 'array-contains', userId).get(),
+    ]);
+
+    const friendUids = new Set();
+    friendsSnap.forEach(doc => doc.data().users.forEach(uid => friendUids.add(uid)));
+
+    const memberUids = new Set();
+    gatheringsSnap.forEach(doc =>
+      (doc.data().memberIds || []).forEach(uid => {
+        if (uid !== userId && !friendUids.has(uid)) memberUids.add(uid);
+      })
+    );
+
+    if (memberUids.size === 0) return res.json([]);
+
+    const profiles = await Promise.all([...memberUids].slice(0, 10).map(async uid => {
+      const doc = await db.collection('users').doc(uid).get();
+      if (!doc.exists) return null;
+      const d = doc.data();
+      return { uid, name: d.name || 'Unknown', username: d.username || '', photoUrl: d.photoUrl || null };
+    }));
+
+    res.json(profiles.filter(Boolean));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/api/users/search', async (req, res) => {
   try {
