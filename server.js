@@ -98,7 +98,7 @@ async function createNotification(userId, type, message) {
 }
 
 // Send via Expo's push service — handles both ExponentPushToken and raw device tokens
-async function sendExpoPushToUids(uids, title, body) {
+async function sendExpoPushToUids(uids, title, body, data = {}, categoryIdentifier) {
   if (!uids.length) return;
   const expoTokens = [];
   const apnsTokens = [];
@@ -109,17 +109,18 @@ async function sendExpoPushToUids(uids, title, body) {
       if (typeof t === 'string' && t.startsWith('ExponentPushToken[')) {
         expoTokens.push(t);
       } else if (typeof t === 'string' && t.length > 0) {
-        apnsTokens.push(t); // raw APNs/FCM device token
+        apnsTokens.push(t);
       }
     }
   }
-  // Send Expo push tokens via Expo's API
   if (expoTokens.length) {
     try {
+      const msg = { title, body, sound: 'default', data };
+      if (categoryIdentifier) msg.categoryIdentifier = categoryIdentifier;
       const res = await fetch('https://exp.host/--/api/v2/push/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify(expoTokens.map(to => ({ to, title, body, sound: 'default' }))),
+        body: JSON.stringify(expoTokens.map(to => ({ ...msg, to }))),
       });
       const result = await res.json();
       const errors = (result.data || []).filter(r => r.status === 'error');
@@ -128,13 +129,13 @@ async function sendExpoPushToUids(uids, title, body) {
       console.error('Expo push failed:', e.message);
     }
   }
-  // Raw device tokens go through FCM (handles both APNs and Android)
   if (apnsTokens.length) {
     try {
       await admin.messaging().sendEachForMulticast({
         tokens: apnsTokens,
         notification: { title, body },
         apns: { payload: { aps: { sound: 'default' } } },
+        data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
       });
     } catch (e) {
       console.error('FCM device token push failed:', e.message);
@@ -178,52 +179,72 @@ async function sendFcmToUids(uids, title, body) {
 }
 
 // Send to all registered push channels for a set of UIDs
-async function sendPushToUids(uids, title, body) {
+async function sendPushToUids(uids, title, body, data = {}, categoryIdentifier) {
   await Promise.all([
-    sendExpoPushToUids(uids, title, body),
+    sendExpoPushToUids(uids, title, body, data, categoryIdentifier),
     sendFcmToUids(uids, title, body),
   ]);
 }
 
-// ── FCM token registration ────────────────────────────────────────────────────
+// ── Shared stat helpers ───────────────────────────────────────────────────────
 
-// Store/update the FCM push token for the authenticated user's device.
-// A user may have multiple devices; we keep up to 10 tokens (deduped).
+function computeStreaks(records) {
+  const sorted = [...records].sort((a, b) => a.time - b.time);
+  let longestStreak = 0, run = 0;
+  for (const r of sorted) { run = r.isOnTime ? run + 1 : 0; if (run > longestStreak) longestStreak = run; }
+  let currentStreak = 0;
+  for (let i = sorted.length - 1; i >= 0; i--) { if (sorted[i].isOnTime) currentStreak++; else break; }
+  return { currentStreak, longestStreak };
+}
+
+function aggregateStats(uid, snapshot) {
+  let attended = 0, onTime = 0, late = 0, totalMinuteOffset = 0;
+  const records = [];
+  snapshot.forEach(doc => {
+    const g = doc.data();
+    const member = g.members?.find(m => m.uid === uid);
+    if (member?.arrivedAt != null) {
+      attended++;
+      if (member.isOnTime) onTime++; else late++;
+      const arrivedMs = member.arrivedAt._seconds ? member.arrivedAt._seconds * 1000 : new Date(member.arrivedAt).getTime();
+      totalMinuteOffset += (arrivedMs - new Date(g.time).getTime()) / 1000 / 60;
+      records.push({ time: new Date(g.time), isOnTime: member.isOnTime });
+    }
+  });
+  const { currentStreak, longestStreak } = computeStreaks(records);
+  return {
+    attended, onTime, late,
+    punctualityRate: attended > 0 ? Math.round((onTime / attended) * 100) : null,
+    avgMinutes: attended > 0 ? Math.round(totalMinuteOffset / attended) : null,
+    currentStreak, longestStreak,
+  };
+}
+
+async function storeToken(uid, field, token) {
+  const userRef = db.collection('users').doc(uid);
+  const userDoc = await userRef.get();
+  const existing = userDoc.exists ? (userDoc.data()[field] || []) : [];
+  if (!existing.includes(token)) await userRef.set({ [field]: [...existing, token].slice(-10) }, { merge: true });
+}
+
+// ── Push token registration ───────────────────────────────────────────────────
+
 app.post('/api/users/fcm-token', async (req, res) => {
   try {
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: 'token is required' });
-
-    const userRef = db.collection('users').doc(req.uid);
-    const userDoc = await userRef.get();
-    const existing = userDoc.exists ? (userDoc.data().fcmTokens || []) : [];
-
-    if (!existing.includes(token)) {
-      const updated = [...existing, token].slice(-10); // keep last 10
-      await userRef.set({ fcmTokens: updated }, { merge: true });
-    }
+    await storeToken(req.uid, 'fcmTokens', token);
     res.json({ success: true });
-  } catch (error) {
-    console.error('Error saving FCM token:', error);
-    res.status(500).json({ error: error.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Store Expo push token (used by Expo Go and Expo-built apps)
 app.post('/api/users/expo-token', async (req, res) => {
   try {
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: 'token is required' });
-    const userRef = db.collection('users').doc(req.uid);
-    const userDoc = await userRef.get();
-    const existing = userDoc.exists ? (userDoc.data().expoPushTokens || []) : [];
-    if (!existing.includes(token)) {
-      await userRef.set({ expoPushTokens: [...existing, token].slice(-10) }, { merge: true });
-    }
+    await storeToken(req.uid, 'expoPushTokens', token);
     res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Notifications ────────────────────────────────────────────────────────────
@@ -264,7 +285,7 @@ app.post('/api/notifications/markRead', async (req, res) => {
 
 app.post('/api/gatherings', async (req, res) => {
   try {
-    const { name, time, location, lat, lng, invitedUserIds } = req.body;
+    const { name, time, location, lat, lng, invitedUserIds, recurrence } = req.body;
     const userId = req.uid;
 
     if (!invitedUserIds || invitedUserIds.length === 0) {
@@ -294,6 +315,7 @@ app.post('/api/gatherings', async (req, res) => {
     const gathering = {
       name, time, location,
       lat: lat ?? null, lng: lng ?? null,
+      recurrence: recurrence || null,
       userId,
       memberIds: members.map(m => m.uid),
       createdAt: new Date(),
@@ -303,11 +325,17 @@ app.post('/api/gatherings', async (req, res) => {
 
     const docRef = await db.collection('gatherings').add(gathering);
 
-    await Promise.all(
-      (invitedUserIds || []).map(uid =>
+    await Promise.all([
+      ...(invitedUserIds || []).map(uid =>
         createNotification(uid, 'gathering_invite', `${creatorName} invited you to "${name}"!`)
-      )
-    );
+      ),
+      sendPushToUids(
+        invitedUserIds || [],
+        `${creatorName} invited you`,
+        `"${name}" — tap to see details`,
+        { gatheringId: docRef.id, screen: 'GatheringDetail' }
+      ),
+    ]);
 
     res.json({ id: docRef.id, ...gathering });
   } catch (error) {
@@ -417,8 +445,9 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
       ));
       await sendPushToUids(
         otherUids,
-        `Late check-in`,
-        `${checkerName} just checked in ${lateMinutes}m late to "${gathering.name}"`
+        `${checkerName} just checked in`,
+        `${lateMinutes}m late to "${gathering.name}"`,
+        { gatheringId: req.params.id, screen: 'GatheringDetail' }
       );
     }
 
@@ -431,7 +460,7 @@ app.post('/api/gatherings/:id/checkin', async (req, res) => {
 
 app.put('/api/gatherings/:id', async (req, res) => {
   try {
-    const { name, time, location, lat, lng } = req.body;
+    const { name, time, location, lat, lng, recurrence } = req.body;
     const userId = req.uid;
     const gatheringRef = db.collection('gatherings').doc(req.params.id);
     const gatheringDoc = await gatheringRef.get();
@@ -443,6 +472,7 @@ app.put('/api/gatherings/:id', async (req, res) => {
     const timeChanged = existing.time !== time;
     await gatheringRef.update({
       name, time, location, lat: lat ?? null, lng: lng ?? null,
+      recurrence: recurrence || null,
       ...(timeChanged && { remindersSent: [] }),
     });
     const updated = await gatheringRef.get();
@@ -516,6 +546,27 @@ app.post('/api/gatherings/:id/join', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark yourself as "can't make it" — stays in member list, no auto-late penalty
+app.post('/api/gatherings/:id/decline', async (req, res) => {
+  try {
+    const userId = req.uid;
+    const gatheringRef = db.collection('gatherings').doc(req.params.id);
+    const gatheringDoc = await gatheringRef.get();
+    if (!gatheringDoc.exists) return res.status(404).json({ error: 'Gathering not found' });
+    const gathering = gatheringDoc.data();
+    const memberIndex = gathering.members.findIndex(m => m.uid === userId);
+    if (memberIndex === -1) return res.status(403).json({ error: 'Not a member' });
+    if (gathering.members[memberIndex].arrivedAt != null) {
+      return res.status(400).json({ error: 'Already checked in' });
+    }
+    gathering.members[memberIndex].declined = true;
+    await gatheringRef.update({ members: gathering.members });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -618,51 +669,17 @@ app.get('/api/leaderboard', async (req, res) => {
     }));
 
     const stats = await Promise.all(allUids.map(async uid => {
-      const snapshot = await db.collection('gatherings')
-        .where('memberIds', 'array-contains', uid)
-        .get();
-
-      let attended = 0, onTime = 0, late = 0, totalMinuteOffset = 0;
-      const checkInRecords = [];
-      snapshot.forEach(doc => {
-        const member = doc.data().members?.find(m => m.uid === uid);
-        if (member?.arrivedAt != null) {
-          attended++;
-          if (member.isOnTime) onTime++; else late++;
-          const arrivedMs = member.arrivedAt._seconds
-            ? member.arrivedAt._seconds * 1000
-            : new Date(member.arrivedAt).getTime();
-          totalMinuteOffset += (arrivedMs - new Date(doc.data().time).getTime()) / 1000 / 60;
-          checkInRecords.push({ time: new Date(doc.data().time), isOnTime: member.isOnTime });
-        }
-      });
-
-      // Compute streaks from actual check-in history (not the stored counter, which can drift)
-      checkInRecords.sort((a, b) => a.time - b.time); // ascending
-      let longestStreak = 0, run = 0;
-      for (const r of checkInRecords) {
-        run = r.isOnTime ? run + 1 : 0;
-        if (run > longestStreak) longestStreak = run;
-      }
-      let currentStreak = 0;
-      for (let i = checkInRecords.length - 1; i >= 0; i--) {
-        if (checkInRecords[i].isOnTime) currentStreak++;
-        else break;
-      }
-
+      const snapshot = await db.collection('gatherings').where('memberIds', 'array-contains', uid).get();
+      const s = aggregateStats(uid, snapshot);
       const profile = profiles[uid] || {};
       return {
         uid,
         name: profile.name || 'Unknown',
         username: profile.username || '',
         photoUrl: profile.photoUrl || null,
-        attended, onTime, late,
-        punctualityRate: attended > 0 ? Math.round((onTime / attended) * 100) : null,
-        avgMinutes: attended > 0 ? Math.round(totalMinuteOffset / attended) : null,
+        ...s,
         points: profile.points || 0,
-        currentStreak,
-        longestStreak,
-        isYou: uid === userId
+        isYou: uid === userId,
       };
     }));
 
@@ -718,20 +735,37 @@ app.get('/api/users/gathered-with', async (req, res) => {
   }
 });
 
+// Check if a username is available (real-time, during setup/edit)
+app.get('/api/users/check-username', async (req, res) => {
+  try {
+    const { username } = req.query;
+    if (!username) return res.status(400).json({ error: 'username required' });
+    const q = username.trim().toLowerCase();
+    const snap = await db.collection('users').where('usernameLower', '==', q).limit(1).get();
+    const taken = snap.docs.some(doc => doc.id !== req.uid);
+    res.json({ available: !taken });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/users/search', async (req, res) => {
   try {
     const { username } = req.query;
     if (!username) return res.status(400).json({ error: 'username is required' });
 
+    const q = username.trim().toLowerCase();
     const snapshot = await db.collection('users')
-      .where('username', '==', username.trim())
+      .where('usernameLower', '>=', q)
+      .where('usernameLower', '<=', q + '')
+      .limit(10)
       .get();
 
     const users = [];
     snapshot.forEach(doc => {
       const data = doc.data();
-      if (data.uid !== req.uid) {
-        users.push({ uid: data.uid, name: data.name, username: data.username });
+      if (doc.id !== req.uid) {
+        users.push({ uid: data.uid || doc.id, name: data.name, username: data.username });
       }
     });
     res.json(users);
@@ -763,6 +797,7 @@ app.put('/api/users/profile', async (req, res) => {
     await db.collection('users').doc(userId).set({
       name: name.trim(),
       username: username.trim(),
+      usernameLower: username.trim().toLowerCase(),
       uid: userId,
       ...(email ? { email } : {}),
       ...(phone ? { phone } : {})
@@ -834,46 +869,18 @@ app.get('/api/users/:uid/stats', async (req, res) => {
     const { uid } = req.params;
     const [userDoc, snapshot] = await Promise.all([
       db.collection('users').doc(uid).get(),
-      db.collection('gatherings').where('memberIds', 'array-contains', uid).get()
+      db.collection('gatherings').where('memberIds', 'array-contains', uid).get(),
     ]);
     if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
     const profile = userDoc.data();
-    let attended = 0, onTime = 0, late = 0, totalMinuteOffset = 0;
-    const checkInRecords = [];
-    snapshot.forEach(doc => {
-      const member = doc.data().members?.find(m => m.uid === uid);
-      if (member?.arrivedAt != null) {
-        attended++;
-        if (member.isOnTime) onTime++; else late++;
-        const arrivedMs = member.arrivedAt._seconds
-          ? member.arrivedAt._seconds * 1000
-          : new Date(member.arrivedAt).getTime();
-        totalMinuteOffset += (arrivedMs - new Date(doc.data().time).getTime()) / 1000 / 60;
-        checkInRecords.push({ time: new Date(doc.data().time), isOnTime: member.isOnTime });
-      }
-    });
-    checkInRecords.sort((a, b) => a.time - b.time);
-    let longestStreak = 0, run = 0;
-    for (const r of checkInRecords) {
-      run = r.isOnTime ? run + 1 : 0;
-      if (run > longestStreak) longestStreak = run;
-    }
-    let currentStreak = 0;
-    for (let i = checkInRecords.length - 1; i >= 0; i--) {
-      if (checkInRecords[i].isOnTime) currentStreak++;
-      else break;
-    }
+    const s = aggregateStats(uid, snapshot);
     res.json({
       uid,
       name: profile.name || 'Unknown',
       username: profile.username || '',
       photoUrl: profile.photoUrl || null,
       points: profile.points || 0,
-      currentStreak,
-      longestStreak,
-      attended, onTime, late,
-      punctualityRate: attended > 0 ? Math.round((onTime / attended) * 100) : null,
-      avgMinutes: attended > 0 ? Math.round(totalMinuteOffset / attended) : null,
+      ...s,
     });
   } catch (error) {
     console.error('Error fetching user stats:', error);
@@ -911,6 +918,7 @@ app.post('/api/friends/request', async (req, res) => {
     const fromDoc = await db.collection('users').doc(fromUserId).get();
     const fromName = fromDoc.exists ? (fromDoc.data().name || 'Someone') : 'Someone';
     await createNotification(toUserId, 'friend_request', `${fromName} sent you a friend request!`);
+    await sendPushToUids([toUserId], `${fromName} added you`, 'Accept in the Friends tab', { screen: 'Friends' });
 
     res.json({ id: docRef.id });
   } catch (error) {
@@ -937,6 +945,7 @@ app.post('/api/friends/accept', async (req, res) => {
     const acceptorDoc = await db.collection('users').doc(data.toUserId).get();
     const acceptorName = acceptorDoc.exists ? (acceptorDoc.data().name || 'Someone') : 'Someone';
     await createNotification(data.fromUserId, 'friend_accepted', `${acceptorName} accepted your friend request!`);
+    await sendPushToUids([data.fromUserId], `${acceptorName} accepted!`, "You're now friends on Clocked", { screen: 'Friends' });
 
     res.json({ success: true });
   } catch (error) {
@@ -1014,6 +1023,7 @@ app.post('/api/gatherings/:id/react', async (req, res) => {
     const ref = db.collection('gatherings').doc(req.params.id);
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ error: 'Not found' });
+    if (!(doc.data().memberIds || []).includes(req.uid)) return res.status(403).json({ error: 'Not a member' });
     const reactions = doc.data().reactions || {};
     if (!reactions[emoji]) reactions[emoji] = [];
     if (reactions[emoji].includes(req.uid)) {
@@ -1146,21 +1156,7 @@ app.get('/api/challenges', async (req, res) => {
       }
     });
 
-    // Compute current streak from leaderboard logic (reuse check-in records)
-    const allCheckIns = [];
-    snap.forEach(doc => {
-      const g = doc.data();
-      const member = g.members?.find(m => m.uid === userId);
-      if (member?.arrivedAt != null) {
-        allCheckIns.push({ time: new Date(g.time), isOnTime: member.isOnTime });
-      }
-    });
-    allCheckIns.sort((a, b) => a.time - b.time);
-    let currentStreak = 0;
-    for (let i = allCheckIns.length - 1; i >= 0; i--) {
-      if (allCheckIns[i].isOnTime) currentStreak++;
-      else break;
-    }
+    const { currentStreak } = aggregateStats(userId, snap);
 
     const challenges = [
       {
@@ -1340,20 +1336,33 @@ async function processAutoLate() {
       const g = doc.data();
       if (g.autoLateProcessed) continue; // already handled
 
-      const unChecked = (g.members || []).filter(m => m.arrivedAt == null);
+      const unChecked = (g.members || []).filter(m => m.arrivedAt == null && !m.declined);
       if (unChecked.length === 0) {
         await doc.ref.update({ autoLateProcessed: true });
-        continue;
+      } else {
+        const updatedMembers = (g.members || []).map(m => {
+          if (m.arrivedAt != null || m.declined) return m;
+          notifications.push({ uid: m.uid, gatheringName: g.name, memberName: m.name, allMembers: g.members });
+          return { ...m, arrivedAt: g.time, isOnTime: false, autoLate: true };
+        });
+        await doc.ref.update({ members: updatedMembers, autoLateProcessed: true });
+        processedCount++;
       }
 
-      const updatedMembers = (g.members || []).map(m => {
-        if (m.arrivedAt != null) return m;
-        notifications.push({ uid: m.uid, gatheringName: g.name, memberName: m.name, allMembers: g.members });
-        return { ...m, arrivedAt: g.time, isOnTime: false, autoLate: true };
-      });
-
-      await doc.ref.update({ members: updatedMembers, autoLateProcessed: true });
-      processedCount++;
+      // Spawn next occurrence for recurring gatherings
+      if (g.recurrence === 'weekly') {
+        const nextTime = new Date(new Date(g.time).getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        await db.collection('gatherings').add({
+          ...g,
+          time: nextTime,
+          members: (g.members || []).map(({ uid, name }) => ({ uid, name, arrivedAt: null, isOnTime: null })),
+          autoLateProcessed: false,
+          remindersSent: [],
+          createdAt: new Date(),
+          reactions: {},
+          liveLocations: {},
+        });
+      }
     }
 
     // Update user stats and send notifications
@@ -1369,7 +1378,11 @@ async function processAutoLate() {
         if (shieldAvailable) {
           // Shield absorbs the no-show — streak survives, points still deducted
           await userRef.update({ points: (userData.points || 0) - 10, [shieldKey]: true });
-          await sendPushToUids([uid], 'Streak shield activated', `Your ${userData.currentStreak}-streak was protected from "${gatheringName}". Shield used for this week.`);
+          await sendPushToUids(
+            [uid],
+            'Streak protected',
+            `Your ${userData.currentStreak}-streak survived "${gatheringName}". Shield used for this week.`
+          );
         } else {
           await userRef.update({ points: (userData.points || 0) - 10, currentStreak: 0 });
         }
@@ -1406,15 +1419,16 @@ async function sendGatheringReminders() {
         label: '60min',
         fromMs: now + 58 * 60 * 1000,
         toMs:   now + 62 * 60 * 1000,
-        title: 'Gathering soon',
-        body:  name => `"${name}" starts in about 1 hour — check-in opens soon!`,
+        title: 'Heads up',
+        body:  name => `${name} is in 1 hour — get ready!`,
       },
       {
         label: '10min',
         fromMs: now + 8  * 60 * 1000,
         toMs:   now + 12 * 60 * 1000,
-        title: 'Time to check in!',
-        body:  name => `"${name}" starts in ~10 minutes. Open the app to check in.`,
+        title: 'Time to head out',
+        body:  name => `${name} starts in 10 minutes. Tap to check in.`,
+        categoryIdentifier: 'CHECKIN_REMINDER',
       },
     ];
 
@@ -1428,7 +1442,8 @@ async function sendGatheringReminders() {
         const sent = g.remindersSent || [];
         if (sent.includes(reminder.label)) continue;
         await doc.ref.update({ remindersSent: [...sent, reminder.label] });
-        await sendPushToUids(g.memberIds || [], reminder.title, reminder.body(g.name));
+        const data = reminder.label === '10min' ? { gatheringId: doc.id, screen: 'GatheringDetail' } : {};
+        await sendPushToUids(g.memberIds || [], reminder.title, reminder.body(g.name), data, reminder.categoryIdentifier);
         console.log(`Reminder [${reminder.label}] sent for "${g.name}"`);
       }
     }
@@ -1458,8 +1473,9 @@ async function sendGatheringReminders() {
       for (const { uid, streak } of atRisk) {
         await sendPushToUids(
           [uid],
-          `Streak at risk`,
-          `Your ${streak}-day streak could break — "${g.name}" starts in 30 min. Don't miss it.`
+          `Don't break your streak`,
+          `You're on a ${streak}-check-in streak. ${g.name} starts in 30 min.`,
+          { gatheringId: doc.id, screen: 'GatheringDetail' }
         );
       }
       if (atRisk.length) console.log(`Streak-risk nudge sent for "${g.name}" to ${atRisk.length} members`);
@@ -1483,6 +1499,22 @@ if (process.env.NODE_ENV === 'production') {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
   });
 }
+
+// ── Dev job trigger (guarded by DEV_SECRET env var) ──────────────────────────
+app.post('/dev/run', async (req, res) => {
+  const secret = process.env.DEV_SECRET;
+  if (!secret || req.headers['x-dev-secret'] !== secret) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { job } = req.body;
+  try {
+    if (job === 'autolate')   { await processAutoLate();        return res.json({ ok: true, ran: 'autolate' }); }
+    if (job === 'reminders')  { await sendGatheringReminders(); return res.json({ ok: true, ran: 'reminders' }); }
+    res.status(400).json({ error: 'Unknown job. Use: autolate | reminders' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
